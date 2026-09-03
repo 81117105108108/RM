@@ -1,229 +1,159 @@
 #!/usr/bin/env python3
 """
-Standalone RepoMap Tool
-
-A command-line tool that generates a "map" of a software repository,
-highlighting important files and definitions based on their relevance.
-Uses Tree-sitter for parsing and PageRank for ranking importance.
+repomap.py - Production CLI for the RepoMapper engine.
 """
 
+from __future__ import annotations
+
 import argparse
+import fnmatch
+import json
 import os
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Set
 
-from utils import count_tokens, read_text, Tag
-from scm import get_scm_fname
-from importance import is_important, filter_important_files
 from repomap_class import RepoMap
 
 
+class GitIgnoreFilter:
+    """Fast hierarchical matcher enforcing standard .gitignore exclusion rules."""
+
+    def __init__(self, root: Path):
+        self.root = root.resolve()
+        self.ignore_dirs: Set[str] = {
+            ".git", "node_modules", "__pycache__", "venv", "env",
+            ".venv", "dist", "build", "target", ".cache", ".repomap*"
+        }
+        self.patterns: List[Tuple[str, bool]] = []
+        self._load_rules()
+
+    def _load_rules(self) -> None:
+        gi_file = self.root / ".gitignore"
+        if gi_file.is_file():
+            try:
+                for line in gi_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        is_negation = line.startswith("!")
+                        if is_negation:
+                            line = line[1:]
+                        if line.endswith("/"):
+                            self.ignore_dirs.add(line.rstrip("/"))
+                        else:
+                            self.patterns.append((line, is_negation))
+            except OSError:
+                pass
+
+    def is_ignored(self, path: Path) -> bool:
+        try:
+            rel = path.resolve().relative_to(self.root).as_posix()
+        except ValueError:
+            return False
+
+        # Directory part matching
+        parts = path.relative_to(self.root).parts
+        for part in parts[:-1]:
+            if part in self.ignore_dirs:
+                return True
+
+        if path.is_dir() and path.name in self.ignore_dirs:
+            return True
+
+        ignored = False
+        for pat, is_neg in self.patterns:
+            if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(path.name, pat):
+                ignored = not is_neg
+        return ignored
+
+
 def find_src_files(directory: str) -> List[str]:
-    """Find source files in a directory."""
-    if not os.path.isdir(directory):
-        return [directory] if os.path.isfile(directory) else []
-    
-    src_files = []
-    for root, dirs, files in os.walk(directory):
-        # Skip hidden directories and common non-source directories
-        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in {'node_modules', '__pycache__', 'venv', 'env'}]
-        
-        for file in files:
-            if not file.startswith('.'):
-                full_path = os.path.join(root, file)
-                src_files.append(full_path)
-    
-    return src_files
+    """Recursively discovers eligible source files, skipping ignored trees and binaries."""
+    root_path = Path(directory).resolve()
+    gi_filter = GitIgnoreFilter(root_path)
+    discovered = []
+
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        current_dir = Path(dirpath)
+        # Prune ignored subtrees from in-place os.walk traversal
+        dirnames[:] = [d for d in dirnames if not gi_filter.is_ignored(current_dir / d)]
+
+        for f in filenames:
+            file_path = current_dir / f
+            if not f.startswith(".") and not gi_filter.is_ignored(file_path):
+                discovered.append(str(file_path))
+
+    return discovered
 
 
-def tool_output(*messages):
-    """Print informational messages."""
-    print(*messages, file=sys.stdout)
-
-
-def tool_warning(message):
-    """Print warning messages."""
-    print(f"Warning: {message}", file=sys.stderr)
-
-
-def tool_error(message):
-    """Print error messages."""
-    print(f"Error: {message}", file=sys.stderr)
-
-
-def main():
-    """Main CLI entry point."""
+def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Generate a repository map showing important code structures.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s .                    # Map current directory
-  %(prog)s src/ --map-tokens 2048  # Map src/ with 2048 token limit
-  %(prog)s file1.py file2.py    # Map specific files
-  %(prog)s --chat-files main.py --other-files src/  # Specify chat vs other files
-        """
+        description="RepoMapper: AST-guided repository context mapping for AI coding agents."
     )
-    
-    parser.add_argument(
-        "paths",
-        nargs="*",
-        help="Files or directories to include in the map"
-    )
-    
-    parser.add_argument(
-        "--root",
-        default=".",
-        help="Repository root directory (default: current directory)"
-    )
-    
-    parser.add_argument(
-        "--map-tokens",
-        type=int,
-        default=8192,
-        help="Maximum tokens for the generated map (default: 8192)"
-    )
-    
-    parser.add_argument(
-        "--chat-files",
-        nargs="*",
-        help="Files currently being edited (given higher priority)"
-    )
-    
-    parser.add_argument(
-        "--other-files",
-        nargs="*",
-        help="Other files to consider for the map"
-    )
-    
-    parser.add_argument(
-        "--mentioned-files",
-        nargs="*",
-        help="Files explicitly mentioned (given higher priority)"
-    )
-    
-    parser.add_argument(
-        "--mentioned-idents",
-        nargs="*",
-        help="Identifiers explicitly mentioned (given higher priority)"
-    )
-    
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose output"
-    )
-    
-    parser.add_argument(
-        "--model",
-        default="gpt-4",
-        help="Model name for token counting (default: gpt-4)"
-    )
-    
-    parser.add_argument(
-        "--max-context-window",
-        type=int,
-        help="Maximum context window size"
-    )
-    
-    parser.add_argument(
-        "--force-refresh",
-        action="store_true",
-        help="Force refresh of caches"
-    )
+    parser.add_argument("paths", nargs="*", default=["."], help="Files or directory trees to index.")
+    parser.add_argument("--root", default=".", help="Repository root boundary.")
+    parser.add_argument("--map-tokens", type=int, default=8192, help="Token ceiling for map output.")
+    parser.add_argument("--chat-files", nargs="*", default=[], help="Actively modified or focused files.")
+    parser.add_argument("--other-files", nargs="*", default=[], help="Secondary contextual scope files.")
+    parser.add_argument("--outline", type=str, default=None, help="Generate structural outline for a single file.")
+    parser.add_argument("--blast-radius", type=str, default=None, help="Compute impact radius for a modified file.")
+    parser.add_argument("--json", action="store_true", help="Format structured output as JSON envelope.")
+    parser.add_argument("--verbose", action="store_true", help="Emit diagnostic telemetry to stderr.")
 
-    parser.add_argument(
-        "--exclude-unranked",
-        action="store_true",
-        help="Exclude files with Page Rank 0 from the map"
-    )
-    
     args = parser.parse_args()
-    
-    # Set up token counter with specified model
-    def token_counter(text: str) -> int:
-        return count_tokens(text, args.model)
-    
-    # Set up output handlers
-    output_handlers = {
-        'info': tool_output,
-        'warning': tool_warning,
-        'error': tool_error
-    }
-    
-    # Process file arguments
-    chat_files_from_args = args.chat_files or [] # These are the paths as strings from the CLI
-    
-    # Determine the list of unresolved path specifications that will form the 'other_files'
-    # These can be files or directories. find_src_files will expand them.
-    unresolved_paths_for_other_files_specs = []
-    if args.other_files:  # If --other-files is explicitly provided, it's the source
-        unresolved_paths_for_other_files_specs.extend(args.other_files)
-    elif args.paths:  # Else, if positional paths are given, they are the source
-        unresolved_paths_for_other_files_specs.extend(args.paths)
-    # If neither, unresolved_paths_for_other_files_specs remains empty.
+    root_dir = Path(args.root).resolve()
 
-    # Now, expand all directory paths in unresolved_paths_for_other_files_specs into actual file lists
-    # and collect all file paths. find_src_files handles both files and directories.
-    effective_other_files_unresolved = []
-    for path_spec_str in unresolved_paths_for_other_files_specs:
-        effective_other_files_unresolved.extend(find_src_files(path_spec_str))
-    
-    # Convert to absolute paths
-    root_path = Path(args.root).resolve()
-    # chat_files for RepoMap are from --chat-files argument, resolved.
-    chat_files = [str(Path(f).resolve()) for f in chat_files_from_args]
-    # other_files for RepoMap are the effective_other_files, resolved after expansion.
-    other_files = [str(Path(f).resolve()) for f in effective_other_files_unresolved]
+    # Diagnostics dispatched strictly to stderr
+    if args.verbose:
+        print(f"[RepoMapper] Root: {root_dir}", file=sys.stderr)
+        print(f"[RepoMapper] Chat files: {args.chat_files}", file=sys.stderr)
 
-    print(f"Chat files: {chat_files}")
-    
-    # Convert mentioned files to sets
-    mentioned_fnames = set(args.mentioned_files) if args.mentioned_files else None
-    mentioned_idents = set(args.mentioned_idents) if args.mentioned_idents else None
-    
-    # Create RepoMap instance
-    repo_map = RepoMap(
+    mapper = RepoMap(
         map_tokens=args.map_tokens,
-        root=str(root_path),
-        token_counter_func=token_counter,
-        file_reader_func=read_text,
-        output_handler_funcs=output_handlers,
-        verbose=args.verbose,
-        max_context_window=args.max_context_window,
-        exclude_unranked=args.exclude_unranked
+        root=str(root_dir),
+        verbose=args.verbose
     )
-    
-    # Generate the map
-    try:
-        map_content = repo_map.get_repo_map(
-            chat_files=chat_files,
-            other_files=other_files,
-            mentioned_fnames=mentioned_fnames,
-            mentioned_idents=mentioned_idents,
-            force_refresh=args.force_refresh
-        )
-        
-        if map_content:
-            if args.verbose:
-                tokens = repo_map.token_count(map_content)
-                tool_output(f"Generated map: {len(map_content)} chars, ~{tokens} tokens")
-            
-            print(map_content)
+
+    # Sub-command: File Outline
+    if args.outline:
+        outline = mapper.get_file_outline(args.outline)
+        if args.json:
+            sys.stdout.write(json.dumps({"outline": outline}) + "\n")
         else:
-            tool_output("No repository map generated.")
-            
-    except KeyboardInterrupt:
-        tool_error("Interrupted by user")
-        sys.exit(1)
-    except Exception as e:
-        tool_error(f"Error generating repository map: {e}")
-        if args.verbose:
-            import traceback
-            traceback.print_exc()
-        sys.exit(1)
+            sys.stdout.write(outline + "\n")
+        return 0
+
+    # Sub-command: Blast Radius
+    if args.blast_radius:
+        impact = mapper.compute_blast_radius(args.blast_radius)
+        sys.stdout.write(json.dumps(impact, indent=2) + "\n")
+        return 0
+
+    # Discover candidate files
+    candidates = []
+    for p in args.paths:
+        target = Path(p).resolve()
+        if target.is_file():
+            candidates.append(str(target))
+        elif target.is_dir():
+            candidates.extend(find_src_files(str(target)))
+
+    all_other_files = sorted(list(set(candidates + [str(Path(f).resolve()) for f in args.other_files])))
+    resolved_chat = [str(Path(f).resolve()) for f in args.chat_files]
+
+    repo_map = mapper.get_repo_map(
+        chat_files=resolved_chat,
+        other_files=all_other_files
+    )
+
+    # Standard data output to stdout
+    if args.json:
+        sys.stdout.write(json.dumps({"repo_map": repo_map}) + "\n")
+    else:
+        sys.stdout.write(repo_map + "\n")
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
