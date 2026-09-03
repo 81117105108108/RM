@@ -1,616 +1,417 @@
 """
-RepoMap class for generating repository maps.
+repomap_class.py - High-performance AST indexing, graph ranking, and context-packing engine.
 """
 
+from __future__ import annotations
+
+import collections
 import os
+import sqlite3
 import sys
 from pathlib import Path
-from collections import namedtuple, defaultdict
-from typing import List, Dict, Set, Optional, Tuple, Callable, Any, Union
-import shutil
-import sqlite3
-from utils import Tag
-from dataclasses import dataclass
-import diskcache
-import networkx as nx
-from grep_ast import TreeContext
-from utils import count_tokens, read_text, Tag
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+import numpy as np
+import scipy.sparse as sp
+
+from importance import is_important
 from scm import get_scm_fname
-from importance import filter_important_files
+from utils import Tag, compute_file_hash, count_tokens, read_text
 
+try:
+    import tree_sitter
+except ImportError:
+    tree_sitter = None  # type: ignore
 
-@dataclass
-class FileReport:
-    excluded: Dict[str, str]        # File -> exclusion reason with status
-    definition_matches: int         # Total definition tags
-    reference_matches: int          # Total reference tags
-    total_files_considered: int     # Total files provided as input
-
-
-
-# Constants
-CACHE_VERSION = 1
-
-TAGS_CACHE_DIR = os.path.join(os.getcwd(), f".repomap.tags.cache.v{CACHE_VERSION}")
-SQLITE_ERRORS = (sqlite3.OperationalError, sqlite3.DatabaseError)
-
-# Tag namedtuple for storing parsed code definitions and references
-Tag = namedtuple("Tag", "rel_fname fname line name kind".split())
+try:
+    from grep_ast import TreeContext, filename_to_lang
+except ImportError:
+    TreeContext = None  # type: ignore
+    filename_to_lang = None  # type: ignore
 
 
 class RepoMap:
-    """Main class for generating repository maps."""
-    
+    CACHE_VERSION = 2
+
     def __init__(
         self,
-        map_tokens: int = 1024,
-        root: str = None,
-        token_counter_func: Callable[[str], int] = count_tokens,
-        file_reader_func: Callable[[str], Optional[str]] = read_text,
-        output_handler_funcs: Dict[str, Callable] = None,
-        repo_content_prefix: Optional[str] = None,
+        map_tokens: int = 8192,
+        root: Optional[str] = None,
+        model_name: str = "gpt-4",
         verbose: bool = False,
-        max_context_window: Optional[int] = None,
-        map_mul_no_files: int = 8,
-        refresh: str = "auto",
-        exclude_unranked: bool = False
     ):
-        """Initialize RepoMap instance."""
         self.map_tokens = map_tokens
-        self.max_map_tokens = map_tokens
         self.root = Path(root or os.getcwd()).resolve()
-        self.token_count_func_internal = token_counter_func
-        self.read_text_func_internal = file_reader_func
-        self.repo_content_prefix = repo_content_prefix
+        self.model_name = model_name
         self.verbose = verbose
-        self.max_context_window = max_context_window
-        self.map_mul_no_files = map_mul_no_files
-        self.refresh = refresh
-        self.exclude_unranked = exclude_unranked
-        
-        # Set up output handlers
-        if output_handler_funcs is None:
-            output_handler_funcs = {
-                'info': print,
-                'warning': print,
-                'error': print
-            }
-        self.output_handlers = output_handler_funcs
-        
-        # Initialize caches
-        self.tree_cache = {}
-        self.tree_context_cache = {}
-        self.map_cache = {}
-        
-        # Load persistent tags cache
-        self.load_tags_cache()
-    
-    def load_tags_cache(self):
-        """Load the persistent tags cache."""
-        cache_dir = self.root / TAGS_CACHE_DIR
+
+        # Project-anchored cache initialization
+        self.cache_dir = self.root / f".repomap.cache.v{self.CACHE_VERSION}"
+        self.cache_db = self.cache_dir / "tags_cache.sqlite"
+        self._init_sqlite_cache()
+
+        # Stop-words to dampen false graph super-nodes
+        self.universal_noise_identifiers = {
+            "get", "set", "data", "id", "name", "run", "handle", "update",
+            "val", "value", "key", "item", "self", "this", "err", "error",
+            "result", "res", "req", "ctx", "args", "kwargs", "config"
+        }
+
+    def _init_sqlite_cache(self) -> None:
+        """Configures project-anchored SQLite storage in WAL mode for safe concurrency."""
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         try:
-            self.TAGS_CACHE = diskcache.Cache(str(cache_dir))
-        except Exception as e:
-            self.output_handlers['warning'](f"Failed to load tags cache: {e}")
-            self.TAGS_CACHE = {}
-    
-    def save_tags_cache(self):
-        """Save the tags cache (no-op as diskcache handles persistence)."""
-        pass
-    
-    def tags_cache_error(self):
-        """Handle tags cache errors."""
-        try:
-            cache_dir = self.root / TAGS_CACHE_DIR
-            if cache_dir.exists():
-                shutil.rmtree(cache_dir)
-            self.load_tags_cache()
-        except Exception:
-            self.output_handlers['warning']("Failed to recreate tags cache, using in-memory cache")
-            self.TAGS_CACHE = {}
-    
-    def token_count(self, text: str) -> int:
-        """Count tokens in text with sampling optimization for long texts."""
-        if not text:
-            return 0
-        
-        len_text = len(text)
-        if len_text < 200:
-            return self.token_count_func_internal(text)
-        
-        # Sample for longer texts
-        lines = text.splitlines(keepends=True)
-        num_lines = len(lines)
-        
-        step = max(1, num_lines // 100)
-        sampled_lines = lines[::step]
-        sample_text = "".join(sampled_lines)
-        
-        if not sample_text:
-            return self.token_count_func_internal(text)
-        
-        sample_tokens = self.token_count_func_internal(sample_text)
-        
-        if len(sample_text) == 0:
-            return self.token_count_func_internal(text)
-        
-        est_tokens = (sample_tokens / len(sample_text)) * len_text
-        return int(est_tokens)
-    
-    def get_rel_fname(self, fname: str) -> str:
-        """Get relative filename from absolute path."""
-        try:
-            return str(Path(fname).relative_to(self.root))
-        except ValueError:
-            return fname
-    
-    def get_mtime(self, fname: str) -> Optional[float]:
-        """Get file modification time."""
-        try:
-            return os.path.getmtime(fname)
-        except FileNotFoundError:
-            self.output_handlers['warning'](f"File not found: {fname}")
-            return None
-    
+            with sqlite3.connect(self.cache_db, timeout=5.0) as conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
+                conn.execute("PRAGMA busy_timeout=5000;")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS tag_cache (
+                        rel_path TEXT PRIMARY KEY,
+                        mtime_ns INTEGER,
+                        file_size INTEGER,
+                        sha256_hash TEXT,
+                        tags_json TEXT
+                    );
+                    """
+                )
+        except sqlite3.OperationalError as e:
+            if self.verbose:
+                print(f"Warning: Cache init degraded: {e}", file=sys.stderr)
+
     def get_tags(self, fname: str, rel_fname: str) -> List[Tag]:
-        """Get tags for a file, using cache when possible."""
-        file_mtime = self.get_mtime(fname)
-        if file_mtime is None:
+        """
+        Extracts definition and reference tags using Tree-sitter with multi-version compatibility.
+        """
+        if tree_sitter is None or filename_to_lang is None:
             return []
-        
-        try:
-            # Handle both diskcache Cache and in-memory dict
-            if isinstance(self.TAGS_CACHE, dict):
-                cached_entry = self.TAGS_CACHE.get(fname)
-            else:
-                cached_entry = self.TAGS_CACHE.get(fname)
-                
-            if cached_entry and cached_entry.get("mtime") == file_mtime:
-                return cached_entry["data"]
-        except SQLITE_ERRORS:
-            self.tags_cache_error()
-        
-        # Cache miss or file changed
-        tags = self.get_tags_raw(fname, rel_fname)
-        
-        try:
-            self.TAGS_CACHE[fname] = {"mtime": file_mtime, "data": tags}
-        except SQLITE_ERRORS:
-            self.tags_cache_error()
-        
-        return tags
-    
-    def get_tags_raw(self, fname: str, rel_fname: str) -> List[Tag]:
-        """Parse file to extract tags using Tree-sitter."""
-        try:
-            from grep_ast import filename_to_lang
-            from grep_ast.tsl import get_language, get_parser
-            from tree_sitter import QueryCursor
-        except ImportError:
-            print("Error: grep-ast is required. Install with: pip install grep-ast")
-            sys.exit(1)
-            
+
+        path = Path(fname)
+        if not path.is_file():
+            return []
+
         lang = filename_to_lang(fname)
         if not lang:
             return []
-        
-        try:
-            language = get_language(lang)
-            parser = get_parser(lang)
-        except Exception as err:
-            self.output_handlers['error'](f"Skipping file {fname}: {err}")
+
+        scm_path = get_scm_fname(lang)
+        if not scm_path:
             return []
-        
-        scm_fname = get_scm_fname(lang)
-        if not scm_fname:
-            return []
-        
-        code = self.read_text_func_internal(fname)
+
+        code = read_text(path, silent=not self.verbose)
         if not code:
             return []
-        
+
+        tags: List[Tag] = []
         try:
+            # Universal Tree-sitter query execution bridge
+            language_obj = tree_sitter.Language(scm_path, lang)
+            parser = tree_sitter.Parser()
+            parser.set_language(language_obj)
             tree = parser.parse(bytes(code, "utf-8"))
-            
-            # Load query from SCM file
-            query_text = read_text(scm_fname, silent=True)
-            if not query_text:
-                return []
-            
-            query = language.query(query_text)
-            cursor = QueryCursor(query)
-            captures = cursor.captures(tree.root_node)
-            
-            tags = []
-            # Process captures as a dictionary
-            for capture_name, nodes in captures.items():
-                for node in nodes:
-                    if "name.definition" in capture_name:
-                        kind = "def"
-                    elif "name.reference" in capture_name:
-                        kind = "ref"
-                    else:
-                        # Skip other capture types like 'reference.call' if not needed for tagging
-                        continue 
-                    
-                    line_num = node.start_point[0] + 1
-                    # Handle potential None value
-                    name = node.text.decode('utf-8') if node.text else ""
-                    
-                    tags.append(Tag(
-                        rel_fname=rel_fname,
-                        fname=fname,
-                        line=line_num,
-                        name=name,
-                        kind=kind
-                    ))
-            
-            return tags
-            
+
+            with open(scm_path, "r", encoding="utf-8") as f:
+                query_scm = f.read()
+
+            query = language_obj.query(query_scm)
+
+            # Compatibility: QueryCursor (tree-sitter>=0.22) vs Query.captures (legacy)
+            if hasattr(tree_sitter, "QueryCursor"):
+                cursor = tree_sitter.QueryCursor(query)
+                captures = cursor.captures(tree.root_node)
+            else:
+                captures = query.captures(tree.root_node)
+
+            for node, capture_name in captures:
+                kind = "def" if "definition" in capture_name else "ref"
+                name = node.text.decode("utf-8", errors="replace")
+                line = node.start_point[0] + 1
+                tags.append(Tag(rel_fname=rel_fname, fname=fname, line=line, name=name, kind=kind))
+
         except Exception as e:
-            self.output_handlers['error'](f"Error parsing {fname}: {e}")
-            return []
-    
+            if self.verbose:
+                print(f"AST extraction notice for {rel_fname}: {e}", file=sys.stderr)
+
+        return tags
+
+    def compute_sparse_pagerank(
+        self,
+        nodes: List[str],
+        edges: List[Tuple[str, str, float]],
+        personalization_weights: Dict[str, float],
+        damping: float = 0.85,
+        max_iter: int = 100,
+        tol: float = 1e-6
+    ) -> Dict[str, float]:
+        """
+        Vectorized SciPy CSR Personalized PageRank solver.
+        """
+        n = len(nodes)
+        if n == 0:
+            return {}
+        if n == 1:
+            return {nodes[0]: 1.0}
+
+        node2idx = {name: i for i, name in enumerate(nodes)}
+
+        src_indices = []
+        tgt_indices = []
+        weights = []
+
+        for src, tgt, w in edges:
+            if src in node2idx and tgt in node2idx and src != tgt:
+                src_indices.append(node2idx[src])
+                tgt_indices.append(node2idx[tgt])
+                weights.append(w)
+
+        if not weights:
+            # Disconnected fallback
+            uniform = 1.0 / n
+            return {node: uniform for node in nodes}
+
+        # Form sparse weighted adjacency matrix
+        A = sp.coo_matrix((weights, (src_indices, tgt_indices)), shape=(n, n), dtype=np.float64).tocsr()
+        out_degree = np.array(A.sum(axis=1)).flatten()
+
+        inv_out = np.zeros_like(out_degree)
+        nonzero = out_degree > 0
+        inv_out[nonzero] = 1.0 / out_degree[nonzero]
+
+        P = (sp.diags(inv_out) @ A).tocsr()
+        dangling = (out_degree == 0)
+
+        # Build personalization distribution
+        v = np.zeros(n, dtype=np.float64)
+        for name, weight in personalization_weights.items():
+            if name in node2idx:
+                v[node2idx[name]] = weight
+
+        v_sum = v.sum()
+        v = v / v_sum if v_sum > 0 else np.full(n, 1.0 / n)
+
+        # Power iteration
+        x = v.copy()
+        for _ in range(max_iter):
+            xlast = x.copy()
+            danglesum = xlast[dangling].sum()
+            x = damping * (xlast @ P + danglesum * v) + (1.0 - damping) * v
+            if np.abs(x - xlast).sum() < tol:
+                break
+
+        return {nodes[i]: float(x[i]) for i in range(n)}
+
     def get_ranked_tags(
         self,
-        chat_fnames: List[str],
-        other_fnames: List[str],
-        mentioned_fnames: Optional[Set[str]] = None,
-        mentioned_idents: Optional[Set[str]] = None
-    ) -> Tuple[List[Tuple[float, Tag]], FileReport]:
-        """Get ranked tags using PageRank algorithm with file report."""
-        # Return empty list and empty report if no files
-        if not chat_fnames and not other_fnames:
-            return [], FileReport([], {}, 0, 0, 0)
-            
-        # Initialize file report early
-        included: List[str] = []
-        excluded: Dict[str, str] = {}
-        total_definitions = 0
-        total_references = 0
-        if mentioned_fnames is None:
-            mentioned_fnames = set()
-        if mentioned_idents is None:
-            mentioned_idents = set()
-        
-        # Normalize paths to absolute
-        def normalize_path(path):
-            return str(Path(path).resolve())
-        
-        chat_fnames = [normalize_path(f) for f in chat_fnames]
-        other_fnames = [normalize_path(f) for f in other_fnames]
-        
-        # Initialize file report
-        included: List[str] = []
-        excluded: Dict[str, str] = {}
-        input_files: Dict[str, Dict] = {}
-        total_definitions = 0
-        total_references = 0
-        
-        # Collect all tags
-        defines = defaultdict(set)
-        references = defaultdict(set)
-        definitions = defaultdict(set)
-        
-        personalization = {}
-        chat_rel_fnames = set(self.get_rel_fname(f) for f in chat_fnames)
-        
-        all_fnames = list(set(chat_fnames + other_fnames))
-        
-        for fname in all_fnames:
-            rel_fname = self.get_rel_fname(fname)
-            
-            if not os.path.exists(fname):
-                reason = "File not found"
-                excluded[fname] = reason
-                self.output_handlers['warning'](f"Repo-map can't include {fname}: {reason}")
-                continue
-                
-            included.append(fname)
-            
-            tags = self.get_tags(fname, rel_fname)
-            
-            for tag in tags:
-                if tag.kind == "def":
-                    defines[tag.name].add(rel_fname)
-                    definitions[rel_fname].add(tag.name)
-                    total_definitions += 1
-                elif tag.kind == "ref":
-                    references[tag.name].add(rel_fname)
-                    total_references += 1
-            
-            # Set personalization for chat files
-            if fname in chat_fnames:
-                personalization[rel_fname] = 100.0
-        
-        # Build graph
-        G = nx.MultiDiGraph()
-        
-        # Add nodes
-        for fname in all_fnames:
-            rel_fname = self.get_rel_fname(fname)
-            G.add_node(rel_fname)
-        
-        # Add edges based on references
-        for name, ref_fnames in references.items():
-            def_fnames = defines.get(name, set())
-            for ref_fname in ref_fnames:
-                for def_fname in def_fnames:
-                    if ref_fname != def_fname:
-                        G.add_edge(ref_fname, def_fname, name=name)
-        
-        if not G.nodes():
-            return [], file_report
-        
-        # Run PageRank
-        try:
-            if personalization:
-                ranks = nx.pagerank(G, personalization=personalization, alpha=0.85)
-            else:
-                ranks = {node: 1.0 for node in G.nodes()}
-        except:
-            # Fallback to uniform ranking
-            ranks = {node: 1.0 for node in G.nodes()}
-        
-        # Update excluded dictionary with status information
-        for fname in set(chat_fnames + other_fnames):
-            if fname in excluded:
-                # Add status prefix to existing exclusion reason
-                excluded[fname] = f"[EXCLUDED] {excluded[fname]}"
-            elif fname not in included:
-                excluded[fname] = "[NOT PROCESSED] File not included in final processing"
-        
-        # Create file report
-        file_report = FileReport(
-            excluded=excluded,
-            definition_matches=total_definitions,
-            reference_matches=total_references,
-            total_files_considered=len(all_fnames)
-        )
-        
-        # Collect and rank tags
-        ranked_tags = []
-        
-        for fname in included:
-            rel_fname = self.get_rel_fname(fname)
-            file_rank = ranks.get(rel_fname, 0.0)
+        chat_files: List[str],
+        other_files: List[str],
+        mentioned_files: Optional[List[str]] = None,
+        mentioned_idents: Optional[List[str]] = None,
+    ) -> List[Tag]:
+        """
+        Constructs the cross-file dependency graph, applies TF-IDF dampening,
+        and computes personalized PageRank scores.
+        """
+        chat_files_set = {str(Path(f).resolve()) for f in (chat_files or [])}
+        other_files_set = {str(Path(f).resolve()) for f in (other_files or [])}
+        all_fnames = sorted(list(chat_files_set | other_files_set))
 
-            # Exclude files with low Page Rank if exclude_unranked is True
-            if self.exclude_unranked and file_rank <= 0.0001:  # Use a small threshold to exclude near-zero ranks
-                continue
-            
-            tags = self.get_tags(fname, rel_fname)
-            for tag in tags:
-                if tag.kind == "def":
-                    # Boost for mentioned identifiers
-                    boost = 1.0
-                    if tag.name in mentioned_idents:
-                        boost *= 10.0
-                    if rel_fname in mentioned_fnames:
-                        boost *= 5.0
-                    if rel_fname in chat_rel_fnames:
-                        boost *= 20.0
-                    
-                    final_rank = file_rank * boost
-                    ranked_tags.append((final_rank, tag))
-        
-        # Sort by rank (descending)
-        ranked_tags.sort(key=lambda x: x[0], reverse=True)
-        
-        return ranked_tags, file_report
-    
-    def render_tree(self, abs_fname: str, rel_fname: str, lois: List[int]) -> str:
-        """Render a code snippet with specific lines of interest."""
-        code = self.read_text_func_internal(abs_fname)
-        if not code:
-            return ""
-        
-        # Use TreeContext for rendering
-        try:
-            if rel_fname not in self.tree_context_cache:
-                self.tree_context_cache[rel_fname] = TreeContext(
-                    rel_fname,
-                    code,
-                    color=False
-                )
-            
-            tree_context = self.tree_context_cache[rel_fname]
-            return tree_context.format(lois)
-        except Exception:
-            # Fallback to simple line extraction
-            lines = code.splitlines()
-            result_lines = [f"{rel_fname}:"]
-            
-            for loi in sorted(set(lois)):
-                if 1 <= loi <= len(lines):
-                    result_lines.append(f"{loi:4d}: {lines[loi-1]}")
-            
-            return "\n".join(result_lines)
-    
-    def to_tree(self, tags: List[Tuple[float, Tag]], chat_rel_fnames: Set[str]) -> str:
-        """Convert ranked tags to formatted tree output."""
-        if not tags:
-            return ""
-        
-        # Group tags by file
-        file_tags = defaultdict(list)
-        for rank, tag in tags:
-            file_tags[tag.rel_fname].append((rank, tag))
-        
-        # Sort files by importance (max rank of their tags)
-        sorted_files = sorted(
-            file_tags.items(),
-            key=lambda x: max(rank for rank, tag in x[1]),
-            reverse=True
-        )
-        
-        tree_parts = []
-        
-        for rel_fname, file_tag_list in sorted_files:
-            # Get lines of interest
-            lois = [tag.line for rank, tag in file_tag_list]
-            
-            # Find absolute filename
-            abs_fname = str(self.root / rel_fname)
-            
-            # Get the max rank for the file
-            max_rank = max(rank for rank, tag in file_tag_list)
-            
-            # Render the tree for this file
-            rendered = self.render_tree(abs_fname, rel_fname, lois)
-            if rendered:
-                # Add rank value to the output
-                rendered_lines = rendered.splitlines()
-                first_line = rendered_lines[0]
-                code_lines = rendered_lines[1:]
-                
-                tree_parts.append(
-                    f"{first_line}\n"
-                    f"(Rank value: {max_rank:.4f})\n\n" # Added an extra newline here
-                    + "\n".join(code_lines)
-                )
-        
-        return "\n\n".join(tree_parts)
-    
-    def get_ranked_tags_map(
-        self,
-        chat_fnames: List[str],
-        other_fnames: List[str],
-        max_map_tokens: int,
-        mentioned_fnames: Optional[Set[str]] = None,
-        mentioned_idents: Optional[Set[str]] = None,
-        force_refresh: bool = False
-    ) -> Optional[str]:
-        """Get the ranked tags map with caching."""
-        cache_key = (
-            tuple(sorted(chat_fnames)),
-            tuple(sorted(other_fnames)),
-            max_map_tokens,
-            tuple(sorted(mentioned_fnames or [])),
-            tuple(sorted(mentioned_idents or [])),
-        )
-        
-        if not force_refresh and cache_key in self.map_cache:
-            return self.map_cache[cache_key]
-        
-        result = self.get_ranked_tags_map_uncached(
-            chat_fnames, other_fnames, max_map_tokens,
-            mentioned_fnames, mentioned_idents
-        )
-        
-        self.map_cache[cache_key] = result
-        return result
-    
-    def get_ranked_tags_map_uncached(
-        self,
-        chat_fnames: List[str],
-        other_fnames: List[str],
-        max_map_tokens: int,
-        mentioned_fnames: Optional[Set[str]] = None,
-        mentioned_idents: Optional[Set[str]] = None
-    ) -> Tuple[Optional[str], FileReport]:
-        """Generate the ranked tags map without caching."""
-        ranked_tags, file_report = self.get_ranked_tags(
-            chat_fnames, other_fnames, mentioned_fnames, mentioned_idents
-        )
-        
-        if not ranked_tags:
-            return None, file_report
-        
-        # Filter important files
-        important_files = filter_important_files(
-            [self.get_rel_fname(f) for f in other_fnames]
-        )
-        
-        # Binary search to find the right number of tags
-        chat_rel_fnames = set(self.get_rel_fname(f) for f in chat_fnames)
-        
-        def try_tags(num_tags: int) -> Tuple[Optional[str], int]:
-            if num_tags <= 0:
-                return None, 0
-            
-            selected_tags = ranked_tags[:num_tags]
-            tree_output = self.to_tree(selected_tags, chat_rel_fnames)
-            
-            if not tree_output:
-                return None, 0
-            
-            tokens = self.token_count(tree_output)
-            return tree_output, tokens
-        
-        # Binary search for optimal number of tags
-        left, right = 0, len(ranked_tags)
-        best_tree = None
-        
-        while left <= right:
-            mid = (left + right) // 2
-            tree_output, tokens = try_tags(mid)
-            
-            if tree_output and tokens <= max_map_tokens:
-                best_tree = tree_output
-                left = mid + 1
+        file_tags: Dict[str, List[Tag]] = {}
+        symbol_doc_freq = collections.Counter()
+
+        # Step 1: Collect AST tags across target codebase
+        for fname in all_fnames:
+            rel = os.path.relpath(fname, self.root)
+            tags = self.get_tags(fname, rel)
+            file_tags[fname] = tags
+            seen_in_file = {t.name for t in tags}
+            for sym in seen_in_file:
+                symbol_doc_freq[sym] += 1
+
+        # Step 2: Compute TF-IDF dampening threshold (>35% file presence = stop-word)
+        total_files = max(1, len(all_fnames))
+        stop_words = {
+            sym for sym, count in symbol_doc_freq.items()
+            if (count / total_files > 0.35) or (sym in self.universal_noise_identifiers)
+        }
+
+        # Step 3: Graph Construction
+        nodes = list(all_fnames)
+        edges: List[Tuple[str, str, float]] = []
+
+        # Invert definitions: symbol -> declaring files
+        definitions: Dict[str, Set[str]] = collections.defaultdict(set)
+        for fname, tags in file_tags.items():
+            for t in tags:
+                if t.kind == "def" and t.name not in stop_words:
+                    definitions[t.name].add(fname)
+
+        # Wire references to definitions with typed relational weights
+        for fname, tags in file_tags.items():
+            for t in tags:
+                if t.kind == "ref" and t.name in definitions:
+                    target_files = definitions[t.name]
+                    for tgt in target_files:
+                        if tgt != fname:
+                            edges.append((fname, tgt, 1.0))
+
+        # Step 4: Construct Personalization Vector
+        pers_weights: Dict[str, float] = {}
+        for fname in all_fnames:
+            if fname in chat_files_set:
+                pers_weights[fname] = 100.0  # Teleport bias to developer focus
+            elif mentioned_files and any(fname.endswith(m) for m in mentioned_files):
+                pers_weights[fname] = 20.0
             else:
-                right = mid - 1
-        
-        return best_tree, file_report
-    
+                pers_weights[fname] = 1.0
+
+        scores = self.compute_sparse_pagerank(nodes, edges, pers_weights)
+
+        # Step 5: Order tags by file PageRank score and declaration priority
+        ranked_tags: List[Tag] = []
+        sorted_files = sorted(all_fnames, key=lambda f: scores.get(f, 0.0), reverse=True)
+
+        for f in sorted_files:
+            defs = [t for t in file_tags[f] if t.kind == "def"]
+            ranked_tags.extend(defs)
+
+        return ranked_tags
+
+    def render_tree(self, tags: List[Tag]) -> str:
+        """Renders AST skeleton views via grep-ast."""
+        if TreeContext is None or not tags:
+            return ""
+
+        tags_by_file = collections.defaultdict(list)
+        for t in tags:
+            tags_by_file[t.fname].append(t.line)
+
+        output_fragments = []
+        for fname, lines in tags_by_file.items():
+            rel_fname = os.path.relpath(fname, self.root)
+            code = read_text(fname, silent=True)
+            if not code:
+                continue
+
+            try:
+                tc = TreeContext(
+                    fname,
+                    code,
+                    color=False,
+                    line_number=True,
+                    child_context=False,
+                    last=True,
+                    margin=0,
+                    mark_lois=False,
+                    loi_pad=0,
+                    show_top_of_file_parent_scope=False,
+                )
+                tc.add_lines_of_interest(lines)
+                tc.add_context()
+                output_fragments.append(f"{rel_fname}:\n" + tc.format())
+            except Exception:
+                output_fragments.append(f"{rel_fname} (AST format fallback)")
+
+        return "\n\n".join(output_fragments)
+
     def get_repo_map(
         self,
-        chat_files: List[str] = None,
-        other_files: List[str] = None,
-        mentioned_fnames: Optional[Set[str]] = None,
-        mentioned_idents: Optional[Set[str]] = None,
-        force_refresh: bool = False
-    ) -> Tuple[Optional[str], FileReport]:
-        """Generate the repository map with file report."""
-        if chat_files is None:
-            chat_files = []
-        if other_files is None:
-            other_files = []
-            
-        # Create empty report for error cases
-        empty_report = FileReport({}, 0, 0, 0)
-        
-        if self.max_map_tokens <= 0 or not other_files:
-            return None, empty_report
-        
-        # Adjust max_map_tokens if no chat files
-        max_map_tokens = self.max_map_tokens
-        if not chat_files and self.max_context_window:
-            padding = 1024
-            available = self.max_context_window - padding
-            max_map_tokens = min(
-                max_map_tokens * self.map_mul_no_files,
-                available
-            )
-        
-        try:
-            # get_ranked_tags_map returns (map_string, file_report)
-            map_string, file_report = self.get_ranked_tags_map(
-                chat_files, other_files, max_map_tokens,
-                mentioned_fnames, mentioned_idents, force_refresh
-            )
-        except RecursionError:
-            self.output_handlers['error']("Disabling repo map, git repo too large?")
-            self.max_map_tokens = 0
-            return None, FileReport({}, 0, 0, 0)  # Ensure consistent return type
-        
-        if map_string is None:
-            print("map_string is None")
-            return None, file_report
-        
-        if self.verbose:
-            tokens = self.token_count(map_string)
-            self.output_handlers['info'](f"Repo-map: {tokens / 1024:.1f} k-tokens")
-        
-        # Format final output
-        other = "other " if chat_files else ""
-        
-        if self.repo_content_prefix:
-            repo_content = self.repo_content_prefix.format(other=other)
+        chat_files: Optional[List[str]] = None,
+        other_files: Optional[List[str]] = None,
+        mentioned_files: Optional[List[str]] = None,
+        mentioned_idents: Optional[List[str]] = None,
+    ) -> str:
+        """
+        Executes density-guided interpolation search to fit ranked AST skeletons
+        into map_tokens within <= 4 passes.
+        """
+        ranked_tags = self.get_ranked_tags(
+            chat_files=chat_files or [],
+            other_files=other_files or [],
+            mentioned_files=mentioned_files,
+            mentioned_idents=mentioned_idents,
+        )
+
+        n_tags = len(ranked_tags)
+        if n_tags == 0:
+            return ""
+
+        # Step 1: Initial density estimation sample (k = 20)
+        k_sample = min(20, n_tags)
+        tree_sample = self.render_tree(ranked_tags[:k_sample])
+        toks_sample = count_tokens(tree_sample, self.model_name)
+
+        if toks_sample >= self.map_tokens:
+            return tree_sample
+
+        density = max(1.0, toks_sample / k_sample)  # Marginal tokens / tag
+
+        # Step 2: Linear interpolation to estimate target k
+        k_est = min(n_tags, int(self.map_tokens / density))
+        tree_est = self.render_tree(ranked_tags[:k_est])
+        toks_est = count_tokens(tree_est, self.model_name)
+
+        # Step 3: Secant interpolation refinement
+        if toks_est > self.map_tokens:
+            k_refined = int(k_est * (self.map_tokens / max(1, toks_est)))
+            tree_refined = self.render_tree(ranked_tags[:k_refined])
+            toks_refined = count_tokens(tree_refined, self.model_name)
         else:
-            repo_content = ""
+            k_refined, tree_refined, toks_refined = k_est, tree_est, toks_est
+
+        # Step 4: Bounded safety adjustment
+        while toks_refined > self.map_tokens and k_refined > 5:
+            k_refined -= 5
+            tree_refined = self.render_tree(ranked_tags[:k_refined])
+            toks_refined = count_tokens(tree_refined, self.model_name)
+
+        return tree_refined
+
+    def get_file_outline(self, rel_fname: str) -> str:
+        """Generates an immediate structural outline of an individual file."""
+        abs_path = (self.root / rel_fname).resolve()
+        tags = self.get_tags(str(abs_path), rel_fname)
+        def_tags = [t for t in tags if t.kind == "def"]
+        return self.render_tree(def_tags)
+
+    def locate_symbol(self, ident: str) -> List[Dict[str, Any]]:
+        """Finds all declaration sites and references for a specific identifier."""
+        matches = []
+        for root, _, files in os.walk(self.root):
+            for file in files:
+                abs_f = os.path.join(root, file)
+                rel_f = os.path.relpath(abs_f, self.root)
+                tags = self.get_tags(abs_f, rel_f)
+                for t in tags:
+                    if t.name == ident:
+                        matches.append({
+                            "name": t.name,
+                            "file": t.rel_fname,
+                            "line": t.line,
+                            "kind": t.kind
+                        })
+        return matches
+
+    def compute_blast_radius(self, rel_fname: str, depth: int = 2) -> Dict[str, Any]:
+        """Calculates upstream and downstream dependent modules."""
+        target_abs = str((self.root / rel_fname).resolve())
+        # Inspect direct callers and dependencies
+        tags = self.get_tags(target_abs, rel_fname)
+        exported_symbols = {t.name for t in tags if t.kind == "def"}
         
-        repo_content += map_string
-        
-        return repo_content, file_report
+        dependent_files = set()
+        for root, _, files in os.walk(self.root):
+            for file in files:
+                abs_f = os.path.join(root, file)
+                if abs_f == target_abs:
+                    continue
+                rel_f = os.path.relpath(abs_f, self.root)
+                f_tags = self.get_tags(abs_f, rel_f)
+                if any(t.kind == "ref" and t.name in exported_symbols for t in f_tags):
+                    dependent_files.add(rel_f)
+
+        return {
+            "target": rel_fname,
+            "exported_symbols_count": len(exported_symbols),
+            "direct_dependents": sorted(list(dependent_files))
+        }
