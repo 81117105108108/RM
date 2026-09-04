@@ -105,25 +105,25 @@ class RepoMap:
 
         tags: List[Tag] = []
         try:
-            # Universal Tree-sitter query execution bridge
-            language_obj = tree_sitter.Language(scm_path, lang)
-            parser = tree_sitter.Parser()
-            parser.set_language(language_obj)
+            # tree-sitter >=0.25 API: Language takes a single capsule arg.
+            # Resolve via tree-sitter-language-pack, never via .scm path.
+            from tree_sitter_language_pack import get_language, get_parser
+            language_obj = get_language(lang)
+            parser = get_parser(lang)
             tree = parser.parse(bytes(code, "utf-8"))
 
             with open(scm_path, "r", encoding="utf-8") as f:
                 query_scm = f.read()
 
-            query = language_obj.query(query_scm)
-
-            # Compatibility: QueryCursor (tree-sitter>=0.22) vs Query.captures (legacy)
-            if hasattr(tree_sitter, "QueryCursor"):
-                cursor = tree_sitter.QueryCursor(query)
-                captures = cursor.captures(tree.root_node)
+            query = tree_sitter.Query(language_obj, query_scm)
+            raw = tree_sitter.QueryCursor(query).captures(tree.root_node)
+            # 0.25+: dict[name, list[Node]]; older: list[(Node, name)]
+            if isinstance(raw, dict):
+                pairs = [(n, nm) for nm, nodes in raw.items() for n in nodes]
             else:
-                captures = query.captures(tree.root_node)
+                pairs = list(raw)
 
-            for node, capture_name in captures:
+            for node, capture_name in pairs:
                 kind = "def" if "definition" in capture_name else "ref"
                 name = node.text.decode("utf-8", errors="replace")
                 line = node.start_point[0] + 1
@@ -300,7 +300,7 @@ class RepoMap:
                     color=False,
                     line_number=True,
                     child_context=False,
-                    last=True,
+                    last_line=True,
                     margin=0,
                     mark_lois=False,
                     loi_pad=0,
